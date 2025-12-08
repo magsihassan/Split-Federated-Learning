@@ -4,7 +4,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from gsfl.models import ClientNet, ServerNet
-from gsfl.sim import uplink_cost, downlink_cost, compute_cost
+from gsfl.sim.comm import comm_delay
+from gsfl.sim.compute import compute_cost
 from gsfl.config import (
     DEVICE,
     BATCH_SIZE,
@@ -14,38 +15,27 @@ from gsfl.config import (
     NUM_GROUPS,
 )
 
-
-# Number of local batches per client per round
-LOCAL_STEPS = 20
+LOCAL_STEPS = 20  # recommended for strong accuracy
 
 
 class GSFLTrainer:
     """
-    Simplified, stable GSFL-style trainer:
-
-    - ONE shared client model (front) across all clients
-    - ONE server model PER GROUP
-    - Split learning done per group (clients in same group share that group's server)
-    - After each round, all server models are federated-averaged
-
-    This keeps:
-      - grouping
-      - split learning
-      - per-group server models
-      - cross-group aggregation (federated averaging)
-    while avoiding the instability of having 16 separate client nets.
+    GSFL Trainer using:
+    - One global client model
+    - One server model per group
+    - Wireless bandwidth simulation per client
     """
 
     def __init__(self, client_datasets, test_loader):
-        assert len(client_datasets) == NUM_CLIENTS, "client_datasets must match NUM_CLIENTS"
+        assert len(client_datasets) == NUM_CLIENTS
 
         self.client_datasets = client_datasets
         self.test_loader = test_loader
 
-        # One global client-side model
+        # Global client model
         self.client = ClientNet().to(DEVICE)
 
-        # One server model per group
+        # Group server models
         self.servers = [ServerNet().to(DEVICE) for _ in range(NUM_GROUPS)]
 
         # Optimizers
@@ -54,87 +44,67 @@ class GSFLTrainer:
 
         self.criterion = nn.CrossEntropyLoss()
 
-        # Fixed equal-size groups
+        # Equal size groups
         self.groups = self._make_groups()
 
     def _make_groups(self):
-        group_size = NUM_CLIENTS // NUM_GROUPS
-        groups = []
-        for g in range(NUM_GROUPS):
-            start = g * group_size
-            end = (g + 1) * group_size
-            groups.append(list(range(start, end)))
-        return groups
+        size = NUM_CLIENTS // NUM_GROUPS
+        return [list(range(g*size, (g+1)*size)) for g in range(NUM_GROUPS)]
 
     def train_round(self):
-        """
-        One GSFL round:
-        - Each group trains on its clients with split learning
-        - Each client contributes LOCAL_STEPS batches
-        - Then server models are federated-averaged across groups
-        """
+        total_loss = 0
+        total_up = 0
+        total_down = 0
+        total_compute = 0
+
         self.client.train()
 
-        total_loss = 0.0
-        total_uplink = 0.0
-        total_downlink = 0.0
-        total_compute = 0.0
-
-        # For each group
         for g_idx, group in enumerate(self.groups):
             server = self.servers[g_idx]
             opt_server = self.opt_servers[g_idx]
+
             server.train()
 
-            # For each client in that group
-            for c_idx in group:
-                ds = self.client_datasets[c_idx]
+            for client_id in group:
+                ds = self.client_datasets[client_id]
                 loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
 
-                # Multiple local steps per client
                 for step, (images, labels) in enumerate(loader):
                     if step >= LOCAL_STEPS:
                         break
 
                     images, labels = images.to(DEVICE), labels.to(DEVICE)
 
-                    # ----- Client forward -----
+                    # Client forward
                     smashed = self.client(images)
 
-                    # Uplink cost (client -> server)
-                    total_uplink += uplink_cost(smashed)
+                    total_up += comm_delay(smashed, client_id)
 
-                    # ----- Server forward -----
+                    # Server forward
                     logits = server(smashed)
 
-                    # Rough compute cost
                     flops = smashed.nelement() * 100
                     total_compute += compute_cost(flops)
 
                     loss = self.criterion(logits, labels)
                     total_loss += loss.item()
 
-                    # ----- Backward -----
+                    # Backprop
                     self.opt_client.zero_grad()
                     opt_server.zero_grad()
-
                     loss.backward()
 
-                    # Downlink cost (server -> client grads, same size as smashed)
-                    total_downlink += downlink_cost(smashed)
+                    total_down += comm_delay(smashed, client_id)
 
-                    # Update models
-                    opt_server.step()
                     self.opt_client.step()
+                    opt_server.step()
 
-        # After all groups/clients trained this round:
-        # federated average server models (group-level aggregation)
-        self._federated_average_servers()
+        self._aggregate_servers()
 
-        return total_loss, total_uplink, total_downlink, total_compute
+        return total_loss, total_up, total_down, total_compute
 
-    def _federated_average_servers(self):
-        """Federated averaging over server models only."""
+    def _aggregate_servers(self):
+        """Federated average server models."""
         with torch.no_grad():
             for params in zip(*[s.parameters() for s in self.servers]):
                 avg = sum(p.data for p in params) / len(params)
@@ -142,10 +112,6 @@ class GSFLTrainer:
                     p.data.copy_(avg)
 
     def evaluate(self):
-        """
-        Evaluate using shared client and (averaged) server model.
-        After federated averaging, all servers are identical, so we use servers[0].
-        """
         self.client.eval()
         server = self.servers[0]
         server.eval()
@@ -156,7 +122,6 @@ class GSFLTrainer:
         with torch.no_grad():
             for images, labels in self.test_loader:
                 images, labels = images.to(DEVICE), labels.to(DEVICE)
-
                 smashed = self.client(images)
                 logits = server(smashed)
 

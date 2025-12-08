@@ -1,6 +1,8 @@
 import sys
 import os
 
+import torch
+
 # Add project root
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
@@ -50,6 +52,8 @@ def main():
 
     print("\nSaved: results/sl_results.json")
 
+    torch.save(trainer.client.state_dict(), "results/sl_client.pt")
+    torch.save(trainer.server.state_dict(), "results/sl_server.pt")
 
 if __name__ == "__main__":
     main()

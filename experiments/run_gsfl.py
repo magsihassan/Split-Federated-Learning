@@ -1,6 +1,8 @@
 import sys
 import os
 
+import torch
+
 # Add project root
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
@@ -49,6 +51,10 @@ def main():
         json.dump(metrics, f, indent=4)
 
     print("\nSaved: results/gsfl_results.json")
+    # Save GSFL averaged models
+    torch.save(trainer.client.state_dict(), "results/gsfl_client.pt")
+    torch.save(trainer.servers[0].state_dict(), "results/gsfl_server.pt")
+
 
 
 if __name__ == "__main__":

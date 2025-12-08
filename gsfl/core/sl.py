@@ -4,16 +4,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from gsfl.models import ClientNet, ServerNet
-from gsfl.sim import uplink_cost, downlink_cost, compute_cost
+from gsfl.sim.comm import comm_delay
+from gsfl.sim.compute import compute_cost
 from gsfl.config import DEVICE, BATCH_SIZE, LR_CLIENT, LR_SERVER
 
 
 class SplitLearningTrainer:
-    """
-    Baseline: sequential Split Learning (SL)
-    One shared client model and one shared server model.
-    Clients are just data partitions.
-    """
     def __init__(self, client_datasets, test_loader):
         self.client_datasets = client_datasets
         self.test_loader = test_loader
@@ -27,52 +23,40 @@ class SplitLearningTrainer:
         self.criterion = nn.CrossEntropyLoss()
 
     def train_round(self):
-        """
-        One SL round:
-        Iterate over all clients once (one batch per client).
-        """
+        total_loss = 0
+        total_up = 0
+        total_down = 0
+        total_compute = 0
+
         self.client.train()
         self.server.train()
-
-        total_loss = 0.0
-        total_uplink = 0.0
-        total_downlink = 0.0
-        total_compute = 0.0
 
         for ds in self.client_datasets:
             loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
             images, labels = next(iter(loader))
             images, labels = images.to(DEVICE), labels.to(DEVICE)
 
-            # Client forward
             smashed = self.client(images)
+            total_up += comm_delay(smashed, 0)
 
-            # Simulated uplink cost
-            total_uplink += uplink_cost(smashed)
-
-            # Server forward
             logits = self.server(smashed)
 
-            # Very rough FLOP estimate: proportional to smashed size
             flops = smashed.nelement() * 100
             total_compute += compute_cost(flops)
 
             loss = self.criterion(logits, labels)
             total_loss += loss.item()
 
-            # Backward
             self.opt_client.zero_grad()
             self.opt_server.zero_grad()
+            loss.backward()
 
-            loss.backward()  # gradients flow into both parts
-
-            # Simulated downlink (server -> client gradients)
-            total_downlink += downlink_cost(smashed)
+            total_down += comm_delay(smashed, 0)
 
             self.opt_server.step()
             self.opt_client.step()
 
-        return total_loss, total_uplink, total_downlink, total_compute
+        return total_loss, total_up, total_down, total_compute
 
     def evaluate(self):
         self.client.eval()
@@ -84,10 +68,8 @@ class SplitLearningTrainer:
         with torch.no_grad():
             for images, labels in self.test_loader:
                 images, labels = images.to(DEVICE), labels.to(DEVICE)
-
                 smashed = self.client(images)
                 logits = self.server(smashed)
-
                 preds = logits.argmax(dim=1)
                 correct += (preds == labels).sum().item()
                 total += labels.size(0)
