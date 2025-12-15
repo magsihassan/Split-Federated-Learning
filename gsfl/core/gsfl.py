@@ -15,7 +15,9 @@ from gsfl.config import (
     NUM_GROUPS,
 )
 
-LOCAL_STEPS = 20  # recommended for strong accuracy
+# Use a few local steps for each client in the group
+# Even with multiple steps, GSFL is faster due to parallel group processing
+LOCAL_STEPS = 5  # 5 batches per client per round
 
 
 class GSFLTrainer:
@@ -24,6 +26,7 @@ class GSFLTrainer:
     - One global client model
     - One server model per group
     - Wireless bandwidth simulation per client
+    - PARALLEL group training (latency = max of group latencies, not sum)
     """
 
     def __init__(self, client_datasets, test_loader):
@@ -53,15 +56,20 @@ class GSFLTrainer:
 
     def train_round(self):
         total_loss = 0
-        total_up = 0
-        total_down = 0
-        total_compute = 0
-
+        
+        # Track latency per group (for parallel simulation)
+        group_latencies = []
+        
         self.client.train()
 
         for g_idx, group in enumerate(self.groups):
             server = self.servers[g_idx]
             opt_server = self.opt_servers[g_idx]
+            
+            # Track this group's latency
+            group_up = 0
+            group_down = 0
+            group_compute = 0
 
             server.train()
 
@@ -78,13 +86,13 @@ class GSFLTrainer:
                     # Client forward
                     smashed = self.client(images)
 
-                    total_up += comm_delay(smashed, client_id)
+                    group_up += comm_delay(smashed, client_id)
 
                     # Server forward
                     logits = server(smashed)
 
                     flops = smashed.nelement() * 100
-                    total_compute += compute_cost(flops)
+                    group_compute += compute_cost(flops)
 
                     loss = self.criterion(logits, labels)
                     total_loss += loss.item()
@@ -94,14 +102,28 @@ class GSFLTrainer:
                     opt_server.zero_grad()
                     loss.backward()
 
-                    total_down += comm_delay(smashed, client_id)
+                    group_down += comm_delay(smashed, client_id)
 
                     self.opt_client.step()
                     opt_server.step()
+            
+            # Store this group's total latency
+            group_latencies.append({
+                'up': group_up,
+                'down': group_down,
+                'compute': group_compute
+            })
 
         self._aggregate_servers()
 
-        return total_loss, total_up, total_down, total_compute
+        # PARALLEL GROUP SIMULATION:
+        # In real GSFL, groups train in parallel, so total time = MAX of group times
+        # Not the SUM of all group times!
+        max_up = max(g['up'] for g in group_latencies)
+        max_down = max(g['down'] for g in group_latencies)
+        max_compute = max(g['compute'] for g in group_latencies)
+
+        return total_loss, max_up, max_down, max_compute
 
     def _aggregate_servers(self):
         """Federated average server models."""
