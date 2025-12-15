@@ -3,3 +3,6 @@ torchvision
 matplotlib
 numpy
 scikit-learn
+streamlit
+plotly
+pandas
